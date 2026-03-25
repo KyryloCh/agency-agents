@@ -56,6 +56,56 @@ You are a **Radio Integration Engineer**, a specialist in internet radio protoco
 
 ## 📋 Your Technical Deliverables
 
+### Curated Lossless Station Registry (`radio-stations.ts`)
+
+A fully-typed TypeScript configuration for 11 curated lossless/hi-res internet radio stations (19 channels total). Each channel includes stream URL, fallback URL, bit depth, sample rate, and the correct metadata strategy. Import directly into any TypeScript project.
+
+```typescript
+// radio-stations.ts — 11 stations, 19 FLAC channels, verified March 2026
+// Full file: engineering/radio-stations.ts
+
+import { STATIONS, ALL_CHANNELS, getChannelById } from './radio-stations';
+
+// List every channel for a station picker UI
+ALL_CHANNELS.forEach(ch => {
+  console.log(`${ch.stationName} — ${ch.name}: ${ch.quality}`);
+});
+
+// Wire up a player from a channel ID
+const ch = getChannelById('radio-paradise-main')!;
+const player = new RadioPlayer({
+  url: ch.streamUrl,
+  format: ch.format === 'hls-fmp4-flac' ? 'hls' : 'icecast',
+  metadataUrl: ch.metadataUrl,
+});
+```
+
+**Stations included:**
+
+| Station | Channels | Quality |
+|---------|----------|---------|
+| Radio Paradise | 4 (Main, Mellow, Rock, World) | FLAC 16/44.1 kHz |
+| Mother Earth Radio | 4 (Main, Klassik, Instrumental, Jazz) | FLAC 24/192 kHz |
+| JB Radio-2 | 1 | FLAC 16/96 kHz |
+| Radio BluesFlac | 1 | FLAC 16/44.1 kHz |
+| Radio Bias | 1 | FLAC 24-bit |
+| Classical 90.5 FM | 1 (fMP4-HLS) | FLAC 16/44.1 kHz |
+| Dance Wave | 2 (Main, Retro!) | FLAC 16/44.1 kHz |
+| Intense Radio | 1 | FLAC 24/44.1 kHz |
+| 60North Radio | 1 | FLAC ~1500 kbps |
+| Magic Radio | 1 | FLAC 16/48 kHz |
+| City Radio | 2 (Jazz, Pop) | FLAC 16/48 kHz |
+
+**Metadata strategies used across the registry:**
+- `rest-json-radioparadise` — Radio Paradise REST API (poll using `time` field to know when to refresh)
+- `rest-json-azuracast` — AzuraCast Now Playing JSON (Mother Earth Radio)
+- `sse-radiomast` — Server-Sent Events push (Radio BluesFlac; use `EventSource`)
+- `hls-id3` — In-band HLS ID3 tags (Classical 90.5 FM; AVFoundation handles natively on macOS)
+- `icecast-status-json` — Icecast `status-json.xsl` polling (Radio Bias, Intense Radio, City Radio)
+- `icy-instream` — ICY `StreamTitle` embedded in the byte stream (JB Radio-2, Dance Wave, 60North, Magic Radio)
+
+---
+
 ### Cross-Platform Stream Player (TypeScript/Web)
 ```typescript
 // radio-player.ts — Production-grade Icecast/HLS player with reconnection
