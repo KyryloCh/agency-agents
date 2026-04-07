@@ -106,6 +106,74 @@ const player = new RadioPlayer({
 
 ---
 
+### Artist & Album Biography Enrichment (`music-metadata-enrichment.ts`)
+
+Enrich now-playing data with artist bios, images, genres, and album info from a cascade of sources. Sources are tried in order; the first successful result wins.
+
+```typescript
+// Full file: engineering/music-metadata-enrichment.ts
+import {
+  createCachedEnrichmentClient,
+  fetchCoverArt,
+  type EnrichedArtist,
+  type EnrichedAlbum,
+} from './music-metadata-enrichment';
+
+const client = createCachedEnrichmentClient({
+  theAudioDbApiKey: process.env.AUDIODB_API_KEY,   // free: theaudiodb.com/register.php
+  lastFmApiKey:     process.env.LASTFM_API_KEY,    // free: last.fm/api/account/create
+  userAgent:        'MyRadioApp/1.0 (dev@example.com)', // required by MusicBrainz ToS
+  biographyLanguage: 'en',
+});
+
+// Wire up to your now-playing callback:
+player.onNowPlaying = async (track) => {
+  const { artist, album } = await client.enrichNowPlaying(track.artist, track.album);
+
+  console.log(artist.bio?.summary);    // 300-char intro from TheAudioDB / Wikipedia
+  console.log(artist.images?.fanart);  // full background image URL
+  console.log(album?.coverArtUrl);     // album cover
+  console.log(album?.description);     // album wiki text
+};
+```
+
+**Enrichment source cascade:**
+
+| Priority | Source | What it provides | Key required? |
+|----------|--------|-----------------|---------------|
+| 1 | **TheAudioDB** | Bio in 6+ languages, artist images (thumb/banner/logo/fanart), genre, mood, formed year, YouTube | Yes (free tier available) |
+| 2 | **Last.fm** | Bio text (Wikipedia-sourced), genre tags, similar artists, cover art | Yes (free) |
+| 3 | **MusicBrainz + Wikipedia** | Artist bio via Wikipedia REST `/page/summary`, country, formed year, MBID | No key needed |
+| 4 | **Cover Art Archive** | Album front cover at 250/500/1200 px, keyed by MusicBrainz release-group MBID | No key needed |
+
+**API endpoints at a glance:**
+
+```
+# TheAudioDB
+GET https://www.theaudiodb.com/api/v1/json/{key}/search.php?s={artist}
+GET https://www.theaudiodb.com/api/v1/json/{key}/searchalbum.php?s={artist}&a={album}
+Rate: 30 req/min free · 100/min premium ($3/mo)
+
+# Last.fm
+GET https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist={name}&api_key={key}&format=json
+GET https://ws.audioscrobbler.com/2.0/?method=album.getInfo&artist={a}&album={b}&api_key={key}&format=json
+Rate: ~5 req/sec (free, no hard published limit)
+
+# MusicBrainz (1 req/sec hard limit — throttle enforced in module)
+GET https://musicbrainz.org/ws/2/artist/?query={name}&fmt=json&limit=1
+GET https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json
+
+# Wikipedia REST (no key, set descriptive User-Agent)
+GET https://en.wikipedia.org/api/rest_v1/page/summary/{article_title}
+
+# Cover Art Archive (no key)
+GET https://coverartarchive.org/release-group/{release-group-mbid}
+```
+
+**Caching:** Results are cached in-memory for 1 hour by default (artist/album info changes very rarely mid-stream). Cache TTL is configurable. Use `client.clearCache()` to flush on demand.
+
+---
+
 ### Cross-Platform Stream Player (TypeScript/Web)
 ```typescript
 // radio-player.ts — Production-grade Icecast/HLS player with reconnection
