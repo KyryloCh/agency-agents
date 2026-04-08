@@ -1,7 +1,7 @@
 // music-metadata-enrichment.ts — Artist & album bio enrichment for radio now-playing
 //
 // Source cascade (tried in order, first successful result wins):
-//   1. TheAudioDB  — richest free data: multi-language bio, artist images, mood/genre, YouTube
+//   1. TheAudioDB  — richest free data: multi-language bio, artist images, mood/genre, discography
 //   2. Last.fm     — bio text sourced from their wiki, tags, similar artists, cover art
 //   3. MusicBrainz + Wikipedia — fully open fallback; chains MBID → Wikipedia article title → REST summary
 //   4. Cover Art Archive — album artwork via MusicBrainz release-group MBID (standalone or as part of chain)
@@ -9,12 +9,29 @@
 // All sources are free. TheAudioDB and Last.fm require API keys (both offer free tiers).
 // MusicBrainz, Wikipedia, and Cover Art Archive require no key.
 //
+// TheAudioDB free API key: sign up at https://www.theaudiodb.com/register.php
+// Sandbox/test key (limited dataset): "123"
+//
 // Rate limits:
-//   TheAudioDB  : 30 req/min (free), 100/min (premium)
+//   TheAudioDB  : 30 req/min (free), 100/min (premium $3/mo)
 //   Last.fm     : ~5 req/sec (free, no hard published limit; be respectful)
 //   MusicBrainz : 1 req/sec (required — enforce with the throttle helper below)
 //   Wikipedia   : No hard limit; set a descriptive User-Agent
 //   Cover Art   : No hard limit
+//
+// TheAudioDB endpoint map (base: https://www.theaudiodb.com/api/v1/json/{key}/)
+//   search.php?s={artist}                      Search artist by name
+//   artist.php?i={artistId}                    Lookup artist by AudioDB ID
+//   artist-mb.php?i={mbid}                     Lookup artist by MusicBrainz ID
+//   discography.php?s={artist}                 All albums for artist (by name)
+//   searchalbum.php?s={artist}&a={album}       Search album by artist + title
+//   album.php?i={artistId}                     All albums for artist (by AudioDB ID)
+//   album.php?m={albumId}                      Lookup album by AudioDB album ID
+//   album-mb.php?i={mbReleaseGroupId}          Lookup album by MusicBrainz release-group ID
+//   searchtrack.php?s={artist}&t={track}       Search track by artist + title  ← key for radio
+//   track.php?m={albumId}                      All tracks in an album
+//   track.php?h={trackId}                      Lookup track by AudioDB track ID
+//   mvid.php?i={artistId}                      Music videos for artist (Patreon key required)
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,10 +95,46 @@ export interface EnrichedAlbum {
   description?: string;
   /** Cover art URL (highest quality available) */
   coverArtUrl?: string;
+  /** AudioDB internal album ID (used to fetch tracks via track.php?m={id}) */
+  audioDbAlbumId?: string;
   /** MusicBrainz release-group MBID */
   mbid?: string;
   /** Source that provided this enrichment */
   source: 'theaudiodb' | 'lastfm' | 'coverartarchive' | 'musicbrainz' | 'none';
+}
+
+export interface EnrichedTrack {
+  /** Track title */
+  title: string;
+  /** Artist name */
+  artist: string;
+  /** Album the track belongs to */
+  album?: string;
+  /** Track number within the album */
+  trackNumber?: number;
+  /** Track duration in seconds */
+  durationMs?: number;
+  /** Genre */
+  genre?: string;
+  /** Cover art from the track's album */
+  coverArtUrl?: string;
+  /** AudioDB album ID (use to fetch full album details) */
+  audioDbAlbumId?: string;
+  /** MusicBrainz track ID */
+  mbid?: string;
+  /** Source that provided this enrichment */
+  source: 'theaudiodb' | 'none';
+}
+
+export interface AlbumSummary {
+  /** AudioDB album ID */
+  audioDbAlbumId: string;
+  /** Album title */
+  title: string;
+  /** Release year */
+  year?: number;
+  /** Cover art thumbnail */
+  coverArtUrl?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +308,266 @@ async function fetchAlbumFromAudioDb(
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Search for a track by artist + title.
+ * Endpoint: /searchtrack.php?s={artist}&t={track}
+ *
+ * This is the critical path for radio streams that give you artist + track title
+ * but no album name. Returns the track's audioDbAlbumId which you can then pass
+ * to fetchAlbumByIdFromAudioDb() to get cover art and album details.
+ *
+ * Key fields: strTrack, strAlbum, idAlbum, intDuration, intTrackNumber,
+ *             strGenre, strMusicBrainzID, strAlbumStrMusicBrainzID
+ */
+async function fetchTrackFromAudioDb(
+  artistName: string,
+  trackTitle: string,
+  config: EnrichmentConfig
+): Promise<EnrichedTrack | null> {
+  if (!config.theAudioDbApiKey) return null;
+
+  const url =
+    `https://www.theaudiodb.com/api/v1/json/${config.theAudioDbApiKey}/searchtrack.php` +
+    `?s=${encodeURIComponent(artistName)}&t=${encodeURIComponent(trackTitle)}`;
+
+  try {
+    const res = await safeFetch(url, { headers: { 'User-Agent': config.userAgent } });
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    const track = json?.track?.[0];
+    if (!track) return null;
+
+    return {
+      title: track.strTrack,
+      artist: track.strArtist,
+      album: track.strAlbum || undefined,
+      trackNumber: track.intTrackNumber ? parseInt(track.intTrackNumber, 10) : undefined,
+      durationMs: track.intDuration ? parseInt(track.intDuration, 10) : undefined,
+      genre: track.strGenre || undefined,
+      coverArtUrl: track.strTrackThumb || undefined,
+      audioDbAlbumId: track.idAlbum || undefined,
+      mbid: track.strMusicBrainzID || undefined,
+      source: 'theaudiodb',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lookup a specific album by its AudioDB album ID.
+ * Endpoint: /album.php?m={albumId}
+ *
+ * Use after fetchTrackFromAudioDb() to get full album details from track.idAlbum.
+ * Returns cover art, description, year, label — everything needed for the now-playing UI.
+ */
+async function fetchAlbumByIdFromAudioDb(
+  albumId: string,
+  config: EnrichmentConfig
+): Promise<EnrichedAlbum | null> {
+  if (!config.theAudioDbApiKey) return null;
+
+  const url = `https://www.theaudiodb.com/api/v1/json/${config.theAudioDbApiKey}/album.php?m=${encodeURIComponent(albumId)}`;
+
+  try {
+    const res = await safeFetch(url, { headers: { 'User-Agent': config.userAgent } });
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    const album = json?.album?.[0];
+    if (!album) return null;
+
+    return {
+      title: album.strAlbum,
+      artist: album.strArtist,
+      year: album.intYearReleased ? parseInt(album.intYearReleased, 10) : undefined,
+      label: album.strLabel || undefined,
+      description: album.strDescriptionEN || undefined,
+      coverArtUrl: album.strAlbumThumb || undefined,
+      audioDbAlbumId: album.idAlbum || undefined,
+      mbid: album.strMusicBrainzID || undefined,
+      source: 'theaudiodb',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lookup an album by MusicBrainz release-group ID.
+ * Endpoint: /album-mb.php?i={mbReleaseGroupId}
+ *
+ * Useful when the radio stream or MusicBrainz lookup provides a release-group MBID
+ * and you want to get AudioDB's richer metadata (description, artwork) for that release.
+ */
+async function fetchAlbumByMbidFromAudioDb(
+  mbReleaseGroupId: string,
+  config: EnrichmentConfig
+): Promise<EnrichedAlbum | null> {
+  if (!config.theAudioDbApiKey) return null;
+
+  const url = `https://www.theaudiodb.com/api/v1/json/${config.theAudioDbApiKey}/album-mb.php?i=${encodeURIComponent(mbReleaseGroupId)}`;
+
+  try {
+    const res = await safeFetch(url, { headers: { 'User-Agent': config.userAgent } });
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    const album = json?.album?.[0];
+    if (!album) return null;
+
+    return {
+      title: album.strAlbum,
+      artist: album.strArtist,
+      year: album.intYearReleased ? parseInt(album.intYearReleased, 10) : undefined,
+      label: album.strLabel || undefined,
+      description: album.strDescriptionEN || undefined,
+      coverArtUrl: album.strAlbumThumb || undefined,
+      audioDbAlbumId: album.idAlbum || undefined,
+      mbid: mbReleaseGroupId,
+      source: 'theaudiodb',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lookup an artist by MusicBrainz artist ID.
+ * Endpoint: /artist-mb.php?i={mbid}
+ *
+ * Useful when the stream metadata or MusicBrainz lookup already gives you a MBID —
+ * skips the name-search step and goes straight to the full artist record.
+ */
+export async function fetchArtistByMbidFromAudioDb(
+  mbid: string,
+  config: EnrichmentConfig
+): Promise<EnrichedArtist | null> {
+  if (!config.theAudioDbApiKey) return null;
+
+  const url = `https://www.theaudiodb.com/api/v1/json/${config.theAudioDbApiKey}/artist-mb.php?i=${encodeURIComponent(mbid)}`;
+
+  try {
+    const res = await safeFetch(url, { headers: { 'User-Agent': config.userAgent } });
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    const artist = json?.artists?.[0];
+    if (!artist) return null;
+
+    const lang = (config.biographyLanguage ?? 'en').toUpperCase();
+    const bioKey = `strBiography${lang === 'EN' ? 'EN' : lang}`;
+    const bioFull: string | undefined = artist[bioKey] || artist.strBiographyEN || undefined;
+
+    return {
+      name: artist.strArtist,
+      bio: bioFull
+        ? {
+            summary: bioFull.slice(0, 300).trimEnd() + (bioFull.length > 300 ? '…' : ''),
+            full: bioFull,
+            language: lang.toLowerCase(),
+            source: 'theaudiodb',
+          }
+        : undefined,
+      images: {
+        thumb: artist.strArtistThumb || undefined,
+        banner: artist.strArtistBanner || undefined,
+        logo: artist.strArtistLogo || undefined,
+        fanart: artist.strArtistFanart || artist.strArtistFanart2 || undefined,
+      },
+      genres: [artist.strGenre, artist.strStyle].filter(Boolean),
+      moods: artist.strMood ? [artist.strMood] : undefined,
+      country: artist.strCountry || undefined,
+      formedYear: artist.intFormedYear ? parseInt(artist.intFormedYear, 10) : undefined,
+      mbid,
+      officialUrl: artist.strWebsite
+        ? artist.strWebsite.startsWith('http')
+          ? artist.strWebsite
+          : `https://${artist.strWebsite}`
+        : undefined,
+      source: 'theaudiodb',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch an artist's full discography (list of albums).
+ * Endpoint: /discography.php?s={artist}
+ *
+ * Returns a lightweight album list (id, title, year, cover art thumb) suitable
+ * for rendering a discography panel alongside the now-playing track.
+ */
+export async function fetchDiscographyFromAudioDb(
+  artistName: string,
+  config: EnrichmentConfig
+): Promise<AlbumSummary[]> {
+  if (!config.theAudioDbApiKey) return [];
+
+  const url =
+    `https://www.theaudiodb.com/api/v1/json/${config.theAudioDbApiKey}/discography.php` +
+    `?s=${encodeURIComponent(artistName)}`;
+
+  try {
+    const res = await safeFetch(url, { headers: { 'User-Agent': config.userAgent } });
+    if (!res.ok) return [];
+
+    const json = await res.json();
+    const albums: unknown[] = json?.album ?? [];
+
+    return albums.map((a: any) => ({
+      audioDbAlbumId: a.idAlbum,
+      title: a.strAlbum,
+      year: a.intYearReleased ? parseInt(a.intYearReleased, 10) : undefined,
+      coverArtUrl: a.strAlbumThumb || undefined,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch all tracks in an album.
+ * Endpoint: /track.php?m={albumId}
+ *
+ * Use after resolving the album (via searchtrack or discography) to display
+ * the full tracklist alongside the now-playing info.
+ */
+export async function fetchTracklistFromAudioDb(
+  audioDbAlbumId: string,
+  config: EnrichmentConfig
+): Promise<EnrichedTrack[]> {
+  if (!config.theAudioDbApiKey) return [];
+
+  const url =
+    `https://www.theaudiodb.com/api/v1/json/${config.theAudioDbApiKey}/track.php` +
+    `?m=${encodeURIComponent(audioDbAlbumId)}`;
+
+  try {
+    const res = await safeFetch(url, { headers: { 'User-Agent': config.userAgent } });
+    if (!res.ok) return [];
+
+    const json = await res.json();
+    const tracks: unknown[] = json?.track ?? [];
+
+    return tracks.map((t: any) => ({
+      title: t.strTrack,
+      artist: t.strArtist,
+      album: t.strAlbum || undefined,
+      trackNumber: t.intTrackNumber ? parseInt(t.intTrackNumber, 10) : undefined,
+      durationMs: t.intDuration ? parseInt(t.intDuration, 10) : undefined,
+      genre: t.strGenre || undefined,
+      audioDbAlbumId,
+      mbid: t.strMusicBrainzID || undefined,
+      source: 'theaudiodb' as const,
+    }));
+  } catch {
+    return [];
   }
 }
 
@@ -580,7 +893,7 @@ export async function enrichArtist(
 
 /**
  * Enrich album info using a cascade of sources.
- * Sources tried in order: TheAudioDB → Last.fm → Cover Art Archive (if MBID known)
+ * Sources tried in order: TheAudioDB (by name) → Last.fm → Cover Art Archive (if MBID known)
  *
  * @example
  * const info = await enrichAlbum('Pink Floyd', 'The Dark Side of the Moon', config);
@@ -592,31 +905,111 @@ export async function enrichAlbum(
   albumTitle: string,
   config: EnrichmentConfig
 ): Promise<EnrichedAlbum> {
-  // 1. TheAudioDB
+  // 1. TheAudioDB — by artist + album name
   const audioDb = await fetchAlbumFromAudioDb(artistName, albumTitle, config);
   if (audioDb?.coverArtUrl || audioDb?.description) return audioDb;
 
   // 2. Last.fm
   const lastFm = await fetchAlbumFromLastFm(artistName, albumTitle, config);
-  if (lastFm?.coverArtUrl || lastFm?.description) return lastFm;
+  if (lastFm?.coverArtUrl || lastFm?.description) {
+    // If Last.fm gave us a MusicBrainz release-group MBID, try Cover Art Archive
+    // as a higher-quality cover art fallback
+    if (lastFm.mbid && !lastFm.coverArtUrl) {
+      const caaArt = await fetchCoverArt(lastFm.mbid, config);
+      if (caaArt) lastFm.coverArtUrl = caaArt;
+    }
+    return lastFm;
+  }
 
   return { title: albumTitle, artist: artistName, source: 'none' };
 }
 
 /**
- * Convenience: enrich both artist and album in parallel.
- * Use when you have both artist + album names from the now-playing metadata.
+ * Enrich a track by artist + track title.
+ *
+ * Radio streams typically give you artist + track title but not album name.
+ * This resolves the track → album automatically:
+ *   1. TheAudioDB searchtrack.php → gets track info + idAlbum
+ *   2. TheAudioDB album.php?m={idAlbum} → gets cover art, description, year
+ *
+ * Returns both the track and its resolved album so the UI can show cover art
+ * and album info without knowing the album title upfront.
+ *
+ * @example
+ * const { track, album } = await enrichTrack('Massive Attack', 'Teardrop', config);
+ * console.log(track.durationMs);
+ * console.log(album?.coverArtUrl);
+ */
+export async function enrichTrack(
+  artistName: string,
+  trackTitle: string,
+  config: EnrichmentConfig
+): Promise<{ track: EnrichedTrack; album: EnrichedAlbum | null }> {
+  const track = await fetchTrackFromAudioDb(artistName, trackTitle, config);
+
+  if (!track) {
+    return {
+      track: { title: trackTitle, artist: artistName, source: 'none' },
+      album: null,
+    };
+  }
+
+  // If we got an album ID from the track, fetch full album details
+  let album: EnrichedAlbum | null = null;
+  if (track.audioDbAlbumId) {
+    album = await fetchAlbumByIdFromAudioDb(track.audioDbAlbumId, config);
+  } else if (track.album) {
+    // Fall back to name-based album lookup
+    album = await enrichAlbum(artistName, track.album, config);
+  }
+
+  return { track, album };
+}
+
+/**
+ * Enrich now-playing data. Handles three cases:
+ *
+ *   1. artist + album title known → enrichArtist + enrichAlbum in parallel
+ *   2. artist + track title known (no album) → enrichArtist + enrichTrack in parallel
+ *      (enrichTrack auto-resolves the album via TheAudioDB's track→album chain)
+ *   3. artist only → enrichArtist only
+ *
+ * @example
+ * // From ICY stream metadata: "Massive Attack - Teardrop"
+ * const result = await enrichNowPlaying({
+ *   artist: 'Massive Attack',
+ *   track: 'Teardrop',
+ * }, config);
+ * console.log(result.artist.bio?.summary);
+ * console.log(result.album?.coverArtUrl);   // resolved via track lookup
  */
 export async function enrichNowPlaying(
-  artistName: string,
-  albumTitle: string | undefined,
+  nowPlaying: { artist: string; track?: string; album?: string },
   config: EnrichmentConfig
-): Promise<{ artist: EnrichedArtist; album: EnrichedAlbum | null }> {
-  const [artist, album] = await Promise.all([
-    enrichArtist(artistName, config),
-    albumTitle ? enrichAlbum(artistName, albumTitle, config) : Promise.resolve(null),
-  ]);
-  return { artist, album };
+): Promise<{ artist: EnrichedArtist; track: EnrichedTrack | null; album: EnrichedAlbum | null }> {
+  const { artist: artistName, track: trackTitle, album: albumTitle } = nowPlaying;
+
+  if (albumTitle) {
+    // Case 1: have album name — direct lookup
+    const [artist, album] = await Promise.all([
+      enrichArtist(artistName, config),
+      enrichAlbum(artistName, albumTitle, config),
+    ]);
+    return { artist, track: null, album };
+  }
+
+  if (trackTitle) {
+    // Case 2: have track title but no album — use track→album chain
+    const [artist, { track, album }] = await Promise.all([
+      enrichArtist(artistName, config),
+      enrichTrack(artistName, trackTitle, config),
+    ]);
+    return { artist, track, album };
+  }
+
+  // Case 3: artist name only
+  const artist = await enrichArtist(artistName, config);
+  return { artist, track: null, album: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -632,11 +1025,26 @@ const _cache = new Map<string, CacheEntry<EnrichedArtist | EnrichedAlbum>>();
 
 /**
  * Cached version of enrichNowPlaying.
- * Default TTL: 1 hour (artists/albums rarely change mid-stream).
+ * Default TTL: 1 hour (artist/album info changes rarely between tracks).
  *
  * @example
- * const client = createCachedEnrichmentClient(config, 3600_000);
- * const { artist, album } = await client.enrichNowPlaying('Radiohead', 'OK Computer');
+ * const client = createCachedEnrichmentClient({
+ *   theAudioDbApiKey: '123',   // sandbox key; replace with your registered key
+ *   lastFmApiKey: 'YOUR_KEY',
+ *   userAgent: 'MyRadioApp/1.0 (dev@example.com)',
+ * });
+ *
+ * // In your now-playing callback:
+ * player.onNowPlaying = async (np) => {
+ *   // Works whether you have album name or just track title
+ *   const { artist, track, album } = await client.enrichNowPlaying({
+ *     artist: np.artist,
+ *     track: np.title,      // ← track title triggers auto album resolution
+ *   });
+ *   showBio(artist.bio?.summary);
+ *   showCover(album?.coverArtUrl);
+ *   showFanart(artist.images?.fanart);
+ * };
  */
 export function createCachedEnrichmentClient(
   config: EnrichmentConfig,
@@ -665,8 +1073,27 @@ export function createCachedEnrichmentClient(
       return value;
     },
 
-    async enrichNowPlaying(artist: string, album?: string) {
-      return enrichNowPlaying(artist, album, config);
+    async enrichTrack(artist: string, track: string) {
+      const key = `track:${artist.toLowerCase()}:${track.toLowerCase()}`;
+      const cached = _cache.get(key) as CacheEntry<{ track: EnrichedTrack; album: EnrichedAlbum | null }> | undefined;
+      if (cached && cached.expiresAt > Date.now()) return cached.value;
+      const value = await enrichTrack(artist, track, config);
+      (_cache as Map<string, CacheEntry<unknown>>).set(key, { value, expiresAt: Date.now() + ttlMs });
+      return value;
+    },
+
+    async enrichNowPlaying(nowPlaying: { artist: string; track?: string; album?: string }) {
+      return enrichNowPlaying(nowPlaying, config);
+    },
+
+    /** Fetch artist discography (list of albums). Not cached — call once per artist load. */
+    async fetchDiscography(artist: string): Promise<AlbumSummary[]> {
+      return fetchDiscographyFromAudioDb(artist, config);
+    },
+
+    /** Fetch full tracklist for an album by AudioDB album ID. */
+    async fetchTracklist(audioDbAlbumId: string): Promise<EnrichedTrack[]> {
+      return fetchTracklistFromAudioDb(audioDbAlbumId, config);
     },
 
     /** Clear all cached entries */
@@ -691,40 +1118,47 @@ function stripHtml(html: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Source reference comments
+// Source reference — full endpoint map
 // ---------------------------------------------------------------------------
 //
-// TheAudioDB
-//   Free tier API key: register at https://www.theaudiodb.com/register.php
-//   Sandbox key (limited dataset): "2"
-//   Artist search:  GET https://www.theaudiodb.com/api/v1/json/{key}/search.php?s={artist}
-//   Album search:   GET https://www.theaudiodb.com/api/v1/json/{key}/searchalbum.php?s={artist}&a={album}
-//   Rate limits:    30 req/min (free) · 100/min (premium $3/mo) · 120/min (business)
-//   Docs:           https://www.theaudiodb.com/api_guide.php
+// TheAudioDB  (base: https://www.theaudiodb.com/api/v1/json/{key}/)
+//   Free API key:    register at https://www.theaudiodb.com/register.php
+//   Sandbox key:     "123"  (limited dataset — good enough for testing)
+//   Rate limits:     30 req/min free · 100/min premium ($3/mo Patreon)
+//
+//   search.php?s={artist}                    → artists[]  (bio, images, genre, formed year)
+//   artist.php?i={audioDbArtistId}           → artists[]  (same shape, lookup by ID)
+//   artist-mb.php?i={mbid}                   → artists[]  (lookup by MusicBrainz artist ID)
+//   discography.php?s={artist}               → album[]    (id, title, year, thumb — lightweight)
+//   searchalbum.php?s={artist}&a={album}     → album[]    (full: description, label, cover art)
+//   album.php?i={audioDbArtistId}            → album[]    (all albums for an artist ID)
+//   album.php?m={audioDbAlbumId}             → album[]    (full album by AudioDB album ID)
+//   album-mb.php?i={mbReleaseGroupId}        → album[]    (full album by MusicBrainz RGID)
+//   searchtrack.php?s={artist}&t={track}     → track[]    (track info + idAlbum ← key for radio)
+//   track.php?m={audioDbAlbumId}             → track[]    (all tracks in an album)
+//   track.php?h={audioDbTrackId}             → track[]    (single track by AudioDB ID)
+//   mvid.php?i={audioDbArtistId}             → mvids[]    (music videos — Patreon key required)
 //
 // Last.fm
 //   Free API key:   https://www.last.fm/api/account/create
-//   Artist info:    GET https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist={name}&api_key={key}&format=json
-//   Album info:     GET https://ws.audioscrobbler.com/2.0/?method=album.getInfo&artist={a}&album={b}&api_key={key}&format=json
-//   Bio note:       Returns HTML; use stripHtml(). Bio sourced from Last.fm wiki (Wikipedia-derived).
+//   Artist info:    GET https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist={name}&api_key={key}&format=json&autocorrect=1
+//   Album info:     GET https://ws.audioscrobbler.com/2.0/?method=album.getInfo&artist={a}&album={b}&api_key={key}&format=json&autocorrect=1
+//   Bio note:       Returns HTML — run through stripHtml(). Sourced from Last.fm wiki (Wikipedia-derived).
 //   Docs:           https://www.last.fm/api/show/artist.getInfo
 //
-// MusicBrainz
-//   No key required. User-Agent header mandatory.
+// MusicBrainz  (no key — User-Agent header mandatory)
 //   Artist search:  GET https://musicbrainz.org/ws/2/artist/?query={name}&fmt=json&limit=1
 //   Artist detail:  GET https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json
-//   Rate limit:     1 req/sec — hard limit; throttled or banned if exceeded
+//   Rate limit:     1 req/sec hard limit — mbThrottle() enforces this automatically
 //   Docs:           https://musicbrainz.org/doc/MusicBrainz_API
 //
-// Wikipedia REST API
-//   No key required.
+// Wikipedia REST API  (no key — set descriptive User-Agent)
 //   Page summary:   GET https://en.wikipedia.org/api/rest_v1/page/summary/{article_title}
-//   Returns:        { extract: "...", thumbnail: { source: "..." }, ... }
-//   Note:           Get article title from MusicBrainz url-rels (type = "wikipedia")
+//   Returns:        { extract: "plain text bio", thumbnail: { source: "..." }, ... }
+//   Get title from: MusicBrainz url-rels where type = "wikipedia" and resource contains "en.wikipedia.org"
 //   Docs:           https://en.wikipedia.org/api/rest_v1/
 //
-// Cover Art Archive
-//   No key required.
-//   Release group:  GET https://coverartarchive.org/release-group/{release-group-mbid}
+// Cover Art Archive  (no key)
+//   Release group:  GET https://coverartarchive.org/release-group/{mbReleaseGroupId}
 //   Returns:        { images: [{ front: true, thumbnails: { "250", "500", "1200" }, image: "..." }] }
 //   Docs:           https://musicbrainz.org/doc/Cover_Art_Archive/API
