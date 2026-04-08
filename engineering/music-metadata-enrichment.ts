@@ -984,10 +984,11 @@ export async function enrichTrack(
  * console.log(result.album?.coverArtUrl);   // resolved via track lookup
  */
 export async function enrichNowPlaying(
-  nowPlaying: { artist: string; track?: string; album?: string },
-  config: EnrichmentConfig
+  artistName: string,
+  albumTitle: string | undefined,
+  config: EnrichmentConfig,
+  trackTitle?: string
 ): Promise<{ artist: EnrichedArtist; track: EnrichedTrack | null; album: EnrichedAlbum | null }> {
-  const { artist: artistName, track: trackTitle, album: albumTitle } = nowPlaying;
 
   if (albumTitle) {
     // Case 1: have album name — direct lookup
@@ -1082,8 +1083,8 @@ export function createCachedEnrichmentClient(
       return value;
     },
 
-    async enrichNowPlaying(nowPlaying: { artist: string; track?: string; album?: string }) {
-      return enrichNowPlaying(nowPlaying, config);
+    async enrichNowPlaying(artist: string, album?: string, track?: string) {
+      return enrichNowPlaying(artist, album, config, track);
     },
 
     /** Fetch artist discography (list of albums). Not cached — call once per artist load. */
