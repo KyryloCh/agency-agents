@@ -189,6 +189,7 @@ The unique specialists who don't fit in a box.
 | 📬 [Report Distribution Agent](specialized/report-distribution-agent.md) | Automated report delivery | Territory-based report distribution, scheduled sends |
 | 🔐 [Agentic Identity & Trust Architect](specialized/agentic-identity-trust.md) | Agent identity, authentication, trust verification | Multi-agent identity systems, agent authorization, audit trails |
 | 🔗 [Identity Graph Operator](specialized/identity-graph-operator.md) | Shared identity resolution for multi-agent systems | Entity deduplication, merge proposals, cross-agent identity consistency |
+| 📈 [Financial Market Analyst](specialized/financial-market-analyst.md) | Equity/crypto research, financial statements, market data | Fundamental analysis, price lookups, market research via Financial Datasets MCP |
 
 ### 🎮 Game Development Division
 
